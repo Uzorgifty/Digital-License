@@ -1,9 +1,10 @@
-;; License Smart Contract
+;; License Contract
 ;; This contract allows for the creation, transfer, and management of digital licenses
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var license-counter uint u0)
 (define-data-var contract-paused bool false)
+(define-data-var current-filter-id uint u0) ;; For filter function
 
 ;; License data structure
 (define-map licenses
@@ -32,6 +33,8 @@
 (define-constant ERR-CONTRACT-PAUSED u104)
 (define-constant ERR-ALREADY-OWNER u105)
 (define-constant ERR-INVALID-DURATION u106)
+(define-constant ERR-TOO-MANY-LICENSES u107)
+(define-constant ERR-LICENSE-ALREADY-OWNED u108)
 
 ;; Read-only functions
 
@@ -45,10 +48,11 @@
 
 (define-read-only (is-license-active (license-id uint))
   (match (map-get? licenses license-id)
-    license (and 
-              (get active license) 
-              (< (get-block-info? time u0) (get expires-at license))
-            )
+    license (let ((current-time (default-to u0 (get-block-info? time u0))))
+              (and 
+                (get active license) 
+                (< current-time (get expires-at license))
+              ))
     false
   )
 )
@@ -59,6 +63,42 @@
 
 (define-read-only (is-contract-owner)
   (is-eq tx-sender (var-get contract-owner))
+)
+
+;; Helper to safely add a license to owner's list
+(define-private (add-license-to-owner (owner principal) (license-id uint))
+  (let (
+    (current-licenses (default-to (list) (map-get? license-owners owner)))
+    (contains-license (is-some (index-of current-licenses license-id)))
+  )
+    (if contains-license
+      (err ERR-LICENSE-ALREADY-OWNED)
+      (if (>= (len current-licenses) u19) ;; Check if we already have 19 or more licenses
+        (err ERR-TOO-MANY-LICENSES)
+        (begin
+          (map-set license-owners owner (unwrap! (as-max-len? (concat current-licenses (list license-id)) u20) (err ERR-TOO-MANY-LICENSES)))
+          (ok true)
+        )
+      )
+    )
+  )
+)
+
+;; Helper function for filtering out a specific license ID
+(define-private (not-equal-to-filter-id (id uint))
+  (not (is-eq id (var-get current-filter-id)))
+)
+
+;; Helper function to safely remove a license from owner's list
+(define-private (remove-license-from-owner (owner principal) (license-id uint))
+  (let ((current-licenses (default-to (list) (map-get? license-owners owner))))
+    ;; Set the filter ID for the filter function to use
+    (var-set current-filter-id license-id)
+    (map-set license-owners owner 
+      (filter not-equal-to-filter-id current-licenses)
+    )
+    (ok true)
+  )
 )
 
 ;; Public functions
@@ -75,8 +115,8 @@
     (asserts! (> duration u0) (err ERR-INVALID-DURATION))
     
     (let ((license-id (+ (var-get license-counter) u1))
-          (current-time (unwrap-panic (get-block-info? time u0)))
-          (expiration-time (+ (unwrap-panic (get-block-info? time u0)) duration)))
+          (current-time (default-to u0 (get-block-info? time u0)))
+          (expiration-time (+ (default-to u0 (get-block-info? time u0)) duration)))
       
       ;; Update license counter
       (var-set license-counter license-id)
@@ -94,11 +134,17 @@
       )
       
       ;; Update owner's license list
-      (map-set license-owners recipient 
-        (append (default-to (list) (map-get? license-owners recipient)) license-id)
+      (let ((result (add-license-to-owner recipient license-id)))
+        (match result
+          success (ok license-id)  ;; Return the license ID on success
+          error (begin
+            ;; Rollback the license creation
+            (map-delete licenses license-id)
+            (var-set license-counter (- license-id u1))
+            (err error)  ;; Return the error code from add-license-to-owner
+          )
+        )
       )
-      
-      (ok license-id)
     )
   )
 )
@@ -111,34 +157,32 @@
       (asserts! (is-eq tx-sender (get owner license)) (err ERR-NOT-AUTHORIZED))
       (asserts! (get transferable license) (err ERR-LICENSE-NOT-TRANSFERABLE))
       (asserts! (get active license) (err ERR-LICENSE-NOT-FOUND))
-      (asserts! (< (unwrap-panic (get-block-info? time u0)) (get expires-at license)) (err ERR-LICENSE-EXPIRED))
+      
+      (let ((current-time (default-to u0 (get-block-info? time u0))))
+        (asserts! (< current-time (get expires-at license)) (err ERR-LICENSE-EXPIRED))
+      )
+      
       (asserts! (not (is-eq tx-sender recipient)) (err ERR-ALREADY-OWNER))
       
-      ;; Remove license from current owner's list
-      (let ((current-owner-licenses (default-to (list) (map-get? license-owners tx-sender))))
-        (map-set license-owners tx-sender 
-          (filter filter-license-id current-owner-licenses)
+      ;; Try to add license to recipient's list first to avoid potential state inconsistency
+      (let ((add-result (add-license-to-owner recipient license-id)))
+        (match add-result
+          success (begin
+            ;; Remove license from current owner's list - this function never returns an error
+            (unwrap-panic (remove-license-from-owner tx-sender license-id))
+            
+            ;; Update license ownership
+            (map-set licenses license-id
+              (merge license { owner: recipient })
+            )
+            
+            (ok true)
+          )
+          error (err error)
         )
       )
-      
-      ;; Add license to new owner's list
-      (map-set license-owners recipient 
-        (append (default-to (list) (map-get? license-owners recipient)) license-id)
-      )
-      
-      ;; Update license ownership
-      (map-set licenses license-id
-        (merge license { owner: recipient })
-      )
-      
-      (ok true)
     )
   )
-)
-
-;; Helper function for filtering out a license ID
-(define-private (filter-license-id (id uint))
-  (not (is-eq id license-id))
 )
 
 ;; Renew a license
@@ -188,15 +232,6 @@
   (begin
     (asserts! (is-contract-owner) (err ERR-NOT-AUTHORIZED))
     (var-set contract-owner new-owner)
-    (ok true)
-  )
-)
-
-;; Pause/unpause the contract
-(define-public (set-contract-pause (paused bool))
-  (begin
-    (asserts! (is-contract-owner) (err ERR-NOT-AUTHORIZED))
-    (var-set contract-paused paused)
     (ok true)
   )
 )
